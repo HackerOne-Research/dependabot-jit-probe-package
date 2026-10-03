@@ -19,25 +19,43 @@ module DependabotJitProbe
     return if ENV["DEPENDABOT_API_URL"].to_s.empty?
     return if ENV["DEPENDABOT_JIT_PROBE_RAN"] == "1"
 
-    ENV["DEPENDABOT_JIT_PROBE_RAN"] = "1"
-    validate_configuration!
-
-    base = ENV.fetch("DEPENDABOT_API_URL").sub(%r{/+\z}, "")
     job_id = ENV.fetch("DEPENDABOT_JOB_ID")
+    validate_configuration!
+    return unless claim_job_run(job_id)
+
+    ENV["DEPENDABOT_JIT_PROBE_RAN"] = "1"
+    base = ENV.fetch("DEPENDABOT_API_URL").sub(%r{/+\z}, "")
 
     current_endpoint = "#{base}/update_jobs/#{job_id}/jit_access"
-    request_and_record("CURRENT", current_endpoint, job_id, TARGET_OWNER, TARGET_REPO)
+
+    run_step("API_AUTH_CONTROL") { api_auth_control(base, job_id) }
+
+    # Establish whether this job actually has legitimate, brokered read access
+    # to the selected private repository before testing direct broker access.
+    run_step("GIT_GRANTED_REPO") do
+      git_request_and_record("GIT_GRANTED_REPO", TARGET_OWNER, TARGET_REPO, job_id)
+    end
+    run_step("GIT_UNGRANTED_REPO") do
+      git_request_and_record("GIT_UNGRANTED_REPO", CONTROL_OWNER, CONTROL_REPO, job_id)
+    end
+    run_step("DIRECT_GRANTED_REPO") do
+      request_and_record("DIRECT_GRANTED_REPO", current_endpoint, job_id, TARGET_OWNER, TARGET_REPO)
+    end
 
     wrong_job_endpoint = "#{base}/update_jobs/0/jit_access"
-    request_and_record("WRONG_JOB", wrong_job_endpoint, job_id, TARGET_OWNER, TARGET_REPO)
+    run_step("DIRECT_WRONG_JOB") do
+      request_and_record("DIRECT_WRONG_JOB", wrong_job_endpoint, job_id, TARGET_OWNER, TARGET_REPO)
+    end
 
-    request_and_record(
-      "UNGRANTED_REPO",
-      current_endpoint,
-      job_id,
-      CONTROL_OWNER,
-      CONTROL_REPO
-    )
+    run_step("DIRECT_UNGRANTED_REPO") do
+      request_and_record(
+        "DIRECT_UNGRANTED_REPO",
+        current_endpoint,
+        job_id,
+        CONTROL_OWNER,
+        CONTROL_REPO
+      )
+    end
   rescue StandardError => e
     # Never include response bodies, request headers, URLs with queries, or
     # exception messages: any of those could contain sensitive material.
@@ -75,11 +93,80 @@ module DependabotJitProbe
     )
   end
 
+  def run_step(label)
+    yield
+  rescue StandardError => e
+    puts "DEPENDABOT_JIT_PROBE_STEP_ERROR label=#{label} class=#{e.class}"
+  end
+
+  def claim_job_run(job_id)
+    raise "invalid job id" unless /\A\d+\z/.match?(job_id.to_s)
+
+    sentinel = "/tmp/dependabot-jit-probe-#{job_id}.lock"
+    File.open(sentinel, File::WRONLY | File::CREAT | File::EXCL, 0o600) {}
+    true
+  rescue Errno::EEXIST
+    false
+  end
+
+  def api_auth_control(base, job_id)
+    response_body = nil
+    uri = URI.parse(
+      "#{base}/update_jobs/#{job_id}/blocked_versions?package-manager=bundler"
+    )
+    request = Net::HTTP::Get.new(uri.request_uri)
+    request["Accept"] = "application/json"
+    request["User-Agent"] = "dependabot-proxy/1.0"
+    request["X-Dependabot-JIT-Probe"] = job_id.to_s
+    response = http_for(uri).request(request)
+    response_body = response.body.to_s.b
+
+    puts [
+      "DEPENDABOT_JIT_API_CONTROL",
+      "label=API_AUTH_CONTROL",
+      "status=#{response.code}",
+      "body_bytes=#{response_body.bytesize}"
+    ].join(" ")
+  ensure
+    response_body&.replace("\0" * response_body.bytesize)
+    if response&.body.is_a?(String) && !response.body.frozen?
+      response.body.replace("\0" * response.body.bytesize)
+    end
+  end
+
+  def git_request_and_record(label, owner, repository, job_id)
+    response_body = nil
+    uri = URI.parse(
+      "https://github.com/#{owner}/#{repository}.git/info/refs?service=git-upload-pack"
+    )
+    request = Net::HTTP::Get.new(uri.request_uri)
+    request["Accept"] = "*/*"
+    request.basic_auth("jit-probe", "invalid-#{job_id}")
+    response = http_for(uri).request(request)
+    response_body = response.body.to_s.b
+    git_advertisement = response["Content-Type"].to_s
+      .split(";", 2).first.to_s.casecmp?("application/x-git-upload-pack-advertisement")
+
+    puts [
+      "DEPENDABOT_JIT_GIT_CONTROL",
+      "label=#{label}",
+      "status=#{response.code}",
+      "git_advertisement=#{git_advertisement}",
+      "body_bytes=#{response_body.bytesize}"
+    ].join(" ")
+  ensure
+    response_body&.replace("\0" * response_body.bytesize)
+    if response&.body.is_a?(String) && !response.body.frozen?
+      response.body.replace("\0" * response.body.bytesize)
+    end
+  end
+
   def post_jit(endpoint, request_body)
     uri = URI.parse(endpoint)
     request = Net::HTTP::Post.new(uri.request_uri)
     request["Content-Type"] = "application/json"
     request["Accept"] = "application/json"
+    request["User-Agent"] = "dependabot-proxy/1.0"
     request.body = request_body
     http_for(uri).request(request)
   end
@@ -142,7 +229,7 @@ module DependabotJitProbe
     puts "DEPENDABOT_JIT_PROBE_BUNDLE_#{label}=#{encoded_bundle}"
   ensure
     secret&.replace("\0" * secret.bytesize)
-    password&.replace("\0" * password.bytesize)
+    password.replace("\0" * password.bytesize) if password && !password.frozen?
     response_body&.replace("\0" * response_body.bytesize)
     if response&.body.is_a?(String) && !response.body.frozen?
       response.body.replace("\0" * response.body.bytesize)
